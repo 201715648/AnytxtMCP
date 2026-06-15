@@ -1,11 +1,19 @@
 """Anytxt HTTP JSON-RPC 2.0 客户端封装"""
 
+import base64
 import json
 import os
 import string
 from typing import Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+
+# 图片文件扩展名集合
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp", ".ico"}
+
+# 图片大小限制
+DEFAULT_MAX_IMAGE_KB = 5120  # 单张图片最大 5MB
+DEFAULT_MAX_IMAGES_IN_SEARCH = 3  # 搜索结果中最多标注几张图片
 
 
 def get_available_drives() -> list[str]:
@@ -339,6 +347,63 @@ class AnytxtClient:
             }
         )
         return result.get("data", {}).get("output", {}).get("text", "")
+
+
+def read_image_base64(file_path: str, max_size_kb: int = DEFAULT_MAX_IMAGE_KB) -> dict:
+    """读取图片文件并返回 base64 数据
+
+    返回格式: {"data": <base64_str>, "mime": <mime_type>, "size_kb": <int>, "ok": True}
+    失败时: {"ok": False, "error": <错误信息>}
+    """
+    if not os.path.exists(file_path):
+        return {"ok": False, "error": f"文件不存在: {file_path}"}
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in IMAGE_EXTENSIONS:
+        return {"ok": False, "error": f"不支持的图片格式: {ext}，支持 {', '.join(sorted(IMAGE_EXTENSIONS))}"}
+
+    file_size = os.path.getsize(file_path)
+    if file_size > max_size_kb * 1024:
+        return {
+            "ok": False,
+            "error": f"图片过大 ({file_size / 1024:.0f}KB)，超过限制 ({max_size_kb}KB)"
+        }
+
+    mime_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".bmp": "image/bmp",
+        ".gif": "image/gif", ".tiff": "image/tiff",
+        ".tif": "image/tiff", ".webp": "image/webp",
+        ".ico": "image/x-icon",
+    }
+
+    try:
+        with open(file_path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        return {
+            "ok": True,
+            "data": data,
+            "mime": mime_map.get(ext, "image/png"),
+            "size_kb": file_size / 1024,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"读取图片失败: {e}"}
+
+
+def is_image_file(file_path: str) -> bool:
+    """判断文件是否为图片"""
+    ext = os.path.splitext(file_path)[1].lower()
+    return ext in IMAGE_EXTENSIONS
+
+
+def get_max_images_in_search() -> int:
+    """从环境变量读取搜索结果中图片标注数量上限"""
+    return int(os.environ.get("ANYTXT_MAX_IMAGES_IN_SEARCH", str(DEFAULT_MAX_IMAGES_IN_SEARCH)))
+
+
+def get_max_image_kb() -> int:
+    """从环境变量读取图片大小上限(KB)"""
+    return int(os.environ.get("ANYTXT_MAX_IMAGE_KB", str(DEFAULT_MAX_IMAGE_KB)))
 
 
 # 全局客户端实例

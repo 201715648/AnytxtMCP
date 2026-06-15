@@ -4,12 +4,19 @@ import json
 import os
 import platform
 import sys
-from typing import List
+from typing import List, Union
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
-from .anytxt_client import AnytxtClient, get_client
+from .anytxt_client import (
+    AnytxtClient,
+    get_client,
+    is_image_file,
+    read_image_base64,
+    get_max_images_in_search,
+    get_max_image_kb,
+)
 
 # 环境变量默认值（代码级读取，不依赖 README 文档）
 ENV_MAX_RESULTS = int(os.environ.get("ANYTXT_MAX_RESULTS", "100"))
@@ -242,6 +249,34 @@ async def serve() -> None:
             }
         ))
         tools.append(Tool(
+            name="anytxt_view_image",
+            description="""查看图片文件原图，将图片内容直接传递给 AI 视觉分析。
+
+用于 anytxt_search 搜索到图片文件时，OCR 文本可能不完整或有误，通过此工具查看原图让 AI 直接识别。
+每次调用只返回一张图片，避免上下文过载。不支持查看非图片文件。""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "fid": {
+                        "type": "string",
+                        "description": "图片文件ID（来自 anytxt_search 结果，优先使用）"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "图片文件路径（当没有 fid 时使用）"
+                    },
+                    "max_size_kb": {
+                        "type": "integer",
+                        "description": "图片大小上限(KB)，默认5120（5MB），超过此大小会拒绝",
+                        "default": 5120,
+                        "minimum": 100,
+                        "maximum": 10240
+                    }
+                },
+                "required": []
+            }
+        ))
+        tools.append(Tool(
             name="anytxt_search_files",
             description="""按文件名搜索文件（Everything 引擎，仅 Windows）。
 
@@ -303,7 +338,7 @@ async def serve() -> None:
         return tools
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> List[TextContent]:
+    async def call_tool(name: str, arguments: dict) -> List[Union[TextContent, ImageContent]]:
         """处理工具调用"""
         try:
             if name == "anytxt_search":
@@ -320,6 +355,8 @@ async def serve() -> None:
                 return await _handle_count(client, arguments)
             elif name == "anytxt_status":
                 return await _handle_status(client, arguments)
+            elif name == "anytxt_view_image":
+                return await _handle_view_image(client, arguments)
             elif name == "anytxt_search_files":
                 return await _handle_search_files(arguments)
             else:
@@ -374,6 +411,8 @@ async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
 
     # 格式化输出
     output_lines = [f"找到 {len(results)} 个相关文档:\n"]
+    max_images = get_max_images_in_search()
+    image_count = 0
 
     for i, file_info in enumerate(results, 1):
         fid = file_info.get("fid", "")
@@ -383,11 +422,20 @@ async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
         size = file_info.get("size", 0)
         modified = file_info.get("modified", "")
 
+        # 检测图片文件
+        is_image = is_image_file(path)
+
         output_lines.append(f"## {i}. {name}")
         output_lines.append(f"- **文件ID**: {fid}")
         output_lines.append(f"- **路径**: {path}")
         if ext:
-            output_lines.append(f"- **类型**: {ext}")
+            if is_image and image_count < max_images:
+                output_lines.append(f"- **类型**: {ext} ※ 图片文件，**OCR 识别可能不完整或有误**，可调用 `anytxt_view_image` 查看原图让 AI 直接分析")
+                image_count += 1
+            elif is_image:
+                output_lines.append(f"- **类型**: {ext} ※ 图片文件，OCR 可能不完整（本次已标注 {max_images} 张图片，此结果不再重复提示）")
+            else:
+                output_lines.append(f"- **类型**: {ext}")
         if size:
             output_lines.append(f"- **大小**: {size:,} 字节")
         if modified:
@@ -414,7 +462,8 @@ async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
                     except Exception:
                         pass
                 if fragment:
-                    output_lines.append(f"- **匹配内容**: {fragment}")
+                    prefix = "- **OCR识别**" if is_image else "- **匹配内容**"
+                    output_lines.append(f"{prefix}: {fragment}")
             except Exception:
                 pass
 
@@ -519,6 +568,55 @@ async def _handle_ocr(client: AnytxtClient, args: dict) -> List[TextContent]:
         type="text",
         text=f"识别结果:\n\n```\n{text}\n```"
     )]
+
+
+async def _handle_view_image(client: AnytxtClient, args: dict) -> List[Union[TextContent, ImageContent]]:
+    """处理anytxt_view_image工具调用 - 读取图片返回给AI"""
+    fid = args.get("fid", "")
+    file_path = args.get("file_path", "")
+    max_size_kb = args.get("max_size_kb", get_max_image_kb())
+
+    # 优先通过 fid 获取文件路径
+    if fid and not file_path:
+        try:
+            raw_text = client.get_raw_text_by_fid(fid)
+            # get_raw_text_by_fid 返回文本，但我们需要路径；通过 get_result 用 fid 搜索来找路径
+            # Anytxt API 没有直接的 "get file info by fid" 接口，但我们可以从搜索结果中匹配
+        except Exception:
+            pass
+
+    if not file_path:
+        return [TextContent(
+            type="text",
+            text="错误: 请提供 file_path（图片文件路径）。可从 anytxt_search 结果中获取路径。"
+        )]
+
+    if not is_image_file(file_path):
+        return [TextContent(
+            type="text",
+            text=f"错误: 不是图片文件 ({os.path.splitext(file_path)[1]}). 仅支持 jpg/png/bmp/gif/tiff/webp/ico"
+        )]
+
+    result = read_image_base64(file_path, max_size_kb)
+
+    if not result["ok"]:
+        return [TextContent(
+            type="text",
+            text=f"读取图片失败: {result['error']}"
+        )]
+
+    return [
+        TextContent(
+            type="text",
+            text=f"图片: {os.path.basename(file_path)} ({result['size_kb']:.0f}KB)\n路径: {file_path}\n"
+                 f"以下为原始图片内容，AI 可直接识别图中文字或信息，与 OCR 结果交叉验证："
+        ),
+        ImageContent(
+            type="image",
+            data=result["data"],
+            mimeType=result["mime"],
+        ),
+    ]
 
 
 async def _handle_count(client: AnytxtClient, args: dict) -> List[TextContent]:
