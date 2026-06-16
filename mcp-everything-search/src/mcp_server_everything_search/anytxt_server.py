@@ -5,7 +5,7 @@ import json
 import os
 import platform
 import sys
-from typing import List, Union
+from typing import List, Union, Optional
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
@@ -31,8 +31,13 @@ ENV_ENABLE_SYNC = os.environ.get("ANYTXT_ENABLE_SYNC", "false").lower() in ("tru
 ENV_ENABLE_OCR = os.environ.get("ANYTXT_ENABLE_OCR", "false").lower() in ("true", "1")
 
 
-def get_tools() -> List[Tool]:
+def get_tools(client: Optional[AnytxtClient] = None) -> List[Tool]:
     """返回Anytxt工具列表，供StdIO及SSE模式共享定义"""
+    if client:
+        try:
+            client._ensure_capabilities()
+        except Exception:
+            pass
     tools = [
         Tool(
             name="anytxt_search",
@@ -148,6 +153,11 @@ def get_tools() -> List[Tool]:
                         "type": "string",
                         "description": "文件ID，来自anytxt_search结果"
                     },
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词（在不支持全文 API 的版本上，根据此关键词退化返回相关匹配片段。建议传入查询该文件时的关键词）",
+                        "default": ""
+                    },
                     "max_chars": {
                         "type": "integer",
                         "description": "最大返回字符数（默认10000）",
@@ -160,11 +170,11 @@ def get_tools() -> List[Tool]:
             }
         ),
     ]
-    if ENV_ENABLE_SYNC:
+    if ENV_ENABLE_SYNC and (not client or "SyncIndex" in client.supported_methods):
         tools.append(Tool(
             name="anytxt_sync_index",
             description="""同步指定文件夹到Anytxt索引。
-
+ 
 用于确保搜索结果包含最新的文件内容。""",
             inputSchema={
                 "type": "object",
@@ -177,11 +187,11 @@ def get_tools() -> List[Tool]:
                 "required": ["folder"]
             }
         ))
-    if ENV_ENABLE_OCR:
+    if ENV_ENABLE_OCR and (not client or "OCR" in client.supported_methods):
         tools.append(Tool(
             name="anytxt_ocr",
             description="""识别图片中的文字内容（需要Anytxt OCR版）。
-
+ 
 用于提取图片、扫描件中的文字。""",
             inputSchema={
                 "type": "object",
@@ -368,7 +378,7 @@ async def serve() -> None:
 
     @server.list_tools()
     async def list_tools() -> List[Tool]:
-        return get_tools()
+        return get_tools(client)
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> List[Union[TextContent, ImageContent]]:
@@ -547,8 +557,8 @@ async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
         if include_fragment and fid:
             try:
                 fragment = await asyncio.to_thread(client.get_fragment, fid, query)
-                # 回退：片段为空时读取原文提取关键词上下文
-                if not fragment:
+                # 回退：片段为空且支持 GetRawTextByFID 时读取原文提取关键词上下文
+                if not fragment and "GetRawTextByFID" in client.supported_methods:
                     try:
                         raw_text = await asyncio.to_thread(client.get_raw_text_by_fid, fid)
                         if raw_text and query:
@@ -583,8 +593,18 @@ async def _handle_get_context(client: AnytxtClient, args: dict) -> List[TextCont
     query = args["query"]
     max_fragments = min(args.get("max_fragments", 5), ENV_MAX_FRAGMENTS)
 
-    # 获取所有片段
-    fragments = await asyncio.to_thread(client.get_fragment_all, fid, query)
+    # 获取所有片段（在不支持时自适应退化）
+    if "GetFragmentAll" in client.supported_methods:
+        try:
+            fragments = await asyncio.to_thread(client.get_fragment_all, fid, query)
+        except Exception:
+            fragments = []
+    else:
+        try:
+            frag = await asyncio.to_thread(client.get_fragment, fid, query)
+            fragments = [frag] if frag else []
+        except Exception:
+            fragments = []
 
     if not fragments:
         return [TextContent(
@@ -611,28 +631,75 @@ async def _handle_read_file(client: AnytxtClient, args: dict) -> List[TextConten
     """处理anytxt_read_file工具调用"""
     fid = args["fid"]
     max_chars = min(args.get("max_chars", 10000), ENV_MAX_RAW_CHARS)
+    query = args.get("query", "")
 
-    # 获取完整文本
-    raw_text = await asyncio.to_thread(client.get_raw_text_by_fid, fid)
+    # 判断是否支持全文接口
+    raw_text = None
+    err_msg = ""
+    if "GetRawTextByFID" in client.supported_methods:
+        try:
+            raw_text = await asyncio.to_thread(client.get_raw_text_by_fid, fid)
+        except Exception as e:
+            err_msg = str(e)
+    else:
+        err_msg = "当前 Anytxt 版本不支持 GetRawTextByFID (获取全文) API"
 
-    if not raw_text:
+    if raw_text:
+        original_len = len(raw_text)
+        truncated = original_len > max_chars
+        display_text = raw_text[:max_chars] + "\n\n... [内容已截断]" if truncated else raw_text
+
+        output_lines = [f"文件内容 (原始 {original_len} 字符):"]
+        if truncated:
+            output_lines.append(f"注意: 已截断，显示前 {max_chars} 字符\n")
+        output_lines.append(f"```\n{display_text}\n```")
+
         return [TextContent(
             type="text",
-            text=f"无法读取文件内容 (FID: {fid})，文件可能已被删除或索引中不存在"
+            text="\n".join(output_lines)
         )]
 
-    original_len = len(raw_text)
-    truncated = original_len > max_chars
-    display_text = raw_text[:max_chars] + "\n\n... [内容已截断]" if truncated else raw_text
+    # 退化处理：尝试使用 GetFragment 或 GetFragmentAll
+    fallback_query = query or "*"
+    fragments = []
+    
+    if "GetFragmentAll" in client.supported_methods:
+        try:
+            fragments = await asyncio.to_thread(client.get_fragment_all, fid, fallback_query)
+        except Exception:
+            pass
+            
+    if not fragments:
+        try:
+            frag = await asyncio.to_thread(client.get_fragment, fid, fallback_query)
+            if frag:
+                fragments = [frag]
+        except Exception:
+            pass
 
-    output_lines = [f"文件内容 (原始 {original_len} 字符):"]
-    if truncated:
-        output_lines.append(f"注意: 已截断，显示前 {max_chars} 字符\n")
-    output_lines.append(f"```\n{display_text}\n```")
+    if fragments:
+        output_lines = [
+            f"提示：由于当前 Anytxt 服务版本限制，不支持 GetRawTextByFID (获取全文) API。已自动为您退化并提取与关键词 '{fallback_query}' 相关的上下文片段：\n"
+        ]
+        for i, fragment in enumerate(fragments, 1):
+            output_lines.append(f"### 片段 {i}")
+            output_lines.append(f"```\n{fragment}\n```\n")
+        return [TextContent(
+            type="text",
+            text="\n".join(output_lines)
+        )]
 
+    # 无法通过任何方式读取内容时
+    path_info = f" (FID: {fid})"
+    resolved_path = client.get_path_by_fid(fid)
+    if resolved_path:
+        path_info = f" (文件路径: {resolved_path})"
+        
     return [TextContent(
         type="text",
-        text="\n".join(output_lines)
+        text=f"无法读取文件内容{path_info}。\n"
+             f"原因：{err_msg}。且未传入有效的 query 参数（或该文件不包含目标关键词），无法获取相关的上下文片段。\n"
+             f"建议：在 anytxt_read_file 调用中指定包含在文件中的关键词 query 参数，或者升级 Anytxt 软件版本。"
     )]
 
 
@@ -757,8 +824,13 @@ async def _handle_status(client: AnytxtClient, args: dict) -> List[TextContent]:
     lines.append("")
 
     try:
+        await asyncio.to_thread(client._ensure_capabilities)
         await asyncio.to_thread(client.search, pattern="anytxt_health_check_test_xyz", filter_ext="*")
         lines.append("**连接状态**: 已连接")
+        lines.append(f"**Anytxt 进程版本**: {client.version}")
+        
+        sorted_methods = sorted(list(client.supported_methods))
+        lines.append(f"**支持的 API 接口**: {', '.join(sorted_methods) if sorted_methods else '无'}")
         lines.append("")
 
         try:

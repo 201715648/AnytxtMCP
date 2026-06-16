@@ -48,6 +48,9 @@ class AnytxtClient:
         self.timeout = timeout_ms / 1000
         self._request_id = 0
         self._fid_to_path: dict[str, str] = {}
+        self._capabilities_detected = False
+        self.supported_methods: set[str] = set()
+        self.version = "Unknown"
         
     def get_path_by_fid(self, fid: str) -> Optional[str]:
         """通过文件ID反查物理路径（从之前搜索结果的缓存中获取）"""
@@ -57,9 +60,86 @@ class AnytxtClient:
         """生成递增的请求ID"""
         self._request_id += 1
         return self._request_id
-    
-    def _call(self, method: str, input_data: dict) -> dict:
+
+    def detect_capabilities(self) -> set[str]:
+        """探测当前 Anytxt 服务支持的方法，并读取其运行的版本"""
+        methods_to_test = {
+            "ATRpcServer.Searcher.V1.Search": "Search",
+            "ATRpcServer.Searcher.V1.GetResult": "GetResult",
+            "ATRpcServer.Searcher.V1.GetFragment": "GetFragment",
+            "ATRpcServer.Searcher.V1.GetFragmentAll": "GetFragmentAll",
+            "ATRpcServer.Searcher.V1.GetRawTextByFID": "GetRawTextByFID",
+            "ATRpcServer.Searcher.V1.SyncIndex": "SyncIndex",
+            "ATRpcServer.Searcher.V1.OCR": "OCR",
+        }
+        
+        self.supported_methods = set()
+        
+        # 探测 API 方法支持情况
+        for rpc_method, alias in methods_to_test.items():
+            try:
+                # 使用空或极简的 input 探测
+                # 即使返回业务错误（如缺少参数），只要不返回 404 且不是 Method not found，就说明该方法存在
+                self._call(rpc_method, {}, detecting=True)
+                self.supported_methods.add(alias)
+            except RuntimeError as e:
+                err_str = str(e)
+                # Anytxt 特有的 404 (方法不存在时返回) 或者标准的 Method not found
+                if "404" in err_str or "Method not found" in err_str:
+                    continue
+                else:
+                    self.supported_methods.add(alias)
+            except Exception:
+                pass
+                
+        # 尝试获取版本信息
+        self.version = self._detect_version()
+        self._capabilities_detected = True
+        return self.supported_methods
+
+    def _detect_version(self) -> str:
+        """通过检测本地 ATGUI.exe 进程获取版本"""
+        try:
+            import subprocess
+            # 使用 Powershell 获取正在运行 of ATGUI 进程路径并提取版本
+            cmd = (
+                "powershell -NoProfile -Command \""
+                "$proc = Get-Process -Name ATGUI -ErrorAction SilentlyContinue; "
+                "if ($proc) { "
+                "  $path = $proc.Path; "
+                "  if ($path) { (Get-Item $path).VersionInfo.ProductVersion } "
+                "}"
+                "\""
+            )
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                encoding="utf-8",
+                errors="ignore"
+            )
+            version = result.stdout.strip()
+            if version:
+                return version.replace(",", ".")
+        except Exception:
+            pass
+        return "Unknown"
+    def _ensure_capabilities(self) -> None:
+        """确保 API 能力已被探测"""
+        if not self._capabilities_detected:
+            self._capabilities_detected = True  # 防御死循环
+            try:
+                self.detect_capabilities()
+            except Exception:
+                pass
+
+    def _call(self, method: str, input_data: dict, detecting: bool = False) -> dict:
         """调用Anytxt JSON-RPC方法"""
+        if not detecting:
+            self._ensure_capabilities()
+
         payload = {
             "id": self._next_id(),
             "jsonrpc": "2.0",
@@ -305,6 +385,10 @@ class AnytxtClient:
         Returns:
             文本片段列表
         """
+        self._ensure_capabilities()
+        if "GetFragmentAll" not in self.supported_methods:
+            raise NotImplementedError("当前 Anytxt 服务版本不支持 GetFragmentAll (多片段获取) API")
+
         result = self._call(
             "ATRpcServer.Searcher.V1.GetFragmentAll",
             {
@@ -323,6 +407,10 @@ class AnytxtClient:
         Returns:
             文件完整文本
         """
+        self._ensure_capabilities()
+        if "GetRawTextByFID" not in self.supported_methods:
+            raise NotImplementedError("当前 Anytxt 服务版本不支持 GetRawTextByFID (获取全文) API")
+
         result = self._call(
             "ATRpcServer.Searcher.V1.GetRawTextByFID",
             {
@@ -340,6 +428,10 @@ class AnytxtClient:
         Returns:
             是否成功
         """
+        self._ensure_capabilities()
+        if "SyncIndex" not in self.supported_methods:
+            raise NotImplementedError("当前 Anytxt 服务版本不支持 SyncIndex (同步索引) API")
+
         result = self._call(
             "ATRpcServer.Searcher.V1.SyncIndex",
             {
@@ -357,6 +449,10 @@ class AnytxtClient:
         Returns:
             识别出的文字
         """
+        self._ensure_capabilities()
+        if "OCR" not in self.supported_methods:
+            raise NotImplementedError("当前 Anytxt 服务版本不支持 OCR (文字识别) API")
+
         result = self._call(
             "ATRpcServer.Searcher.V1.OCR",
             {

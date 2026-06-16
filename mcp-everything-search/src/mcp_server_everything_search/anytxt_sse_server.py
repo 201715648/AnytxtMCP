@@ -40,7 +40,7 @@ async def serve_sse() -> None:
 
     @server.list_tools()
     async def list_tools():
-        return get_tools()
+        return get_tools(client)
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict):
