@@ -17,7 +17,6 @@ from .anytxt_client import (
     read_image_base64,
     get_max_images_in_search,
     get_max_image_kb,
-    get_available_drives,
 )
 
 # 环境变量默认值（代码级读取，不依赖 README 文档）
@@ -405,56 +404,22 @@ async def _get_result_all_drives_async(
     offset: int = 0,
     order: int = 0,
 ) -> list[dict]:
-    """在所有可用驱动器上异步并行搜索并合并结果"""
-    drives = await asyncio.to_thread(get_available_drives)
-    all_files: list[dict] = []
-    seen_fids: set[str] = set()
-    per_drive_limit = max(limit + offset, 100)
+    """全局搜索并返回结果列表。
 
-    tasks = []
-    for drive in drives:
-        tasks.append(
-            asyncio.to_thread(
-                client.get_result,
-                pattern=pattern,
-                filter_dir=drive,
-                filter_ext=filter_ext,
-                last_modify_begin=last_modify_begin,
-                last_modify_end=last_modify_end,
-                limit=per_drive_limit,
-                offset=0,
-                order=order,
-            )
-        )
-
-    results_list = await asyncio.gather(*tasks, return_exceptions=True)
-    for res in results_list:
-        if isinstance(res, Exception):
-            continue
-        for f in res:
-            fid = f.get("fid", "")
-            if fid and fid not in seen_fids:
-                seen_fids.add(fid)
-                all_files.append(f)
-
-    # 安全的 modified 提取函数，防止 TypeError
-    def safe_get_modified(f):
-        val = f.get("modified", 0)
-        try:
-            return int(val)
-        except (ValueError, TypeError):
-            return 0
-
-    if order == 2:
-        all_files.sort(key=safe_get_modified, reverse=True)
-    elif order == 1:
-        all_files.sort(key=safe_get_modified)
-    elif order == 4:
-        all_files.sort(key=lambda f: f.get("path", ""), reverse=True)
-    elif order == 3:
-        all_files.sort(key=lambda f: f.get("path", ""))
-
-    return all_files[offset:offset + limit]
+    Anytxt 索引已全局建立，filterDir 按盘符拆分反而返回 0，
+    直接用空 filterDir 全局搜索，速度更快且结果完整。
+    """
+    return await asyncio.to_thread(
+        client.get_result,
+        pattern=pattern,
+        filter_dir="",
+        filter_ext=filter_ext,
+        last_modify_begin=last_modify_begin,
+        last_modify_end=last_modify_end,
+        limit=limit,
+        offset=offset,
+        order=order,
+    )
 
 
 async def _search_all_drives_async(
@@ -464,27 +429,18 @@ async def _search_all_drives_async(
     last_modify_begin: int = 0,
     last_modify_end: int = 2147483647,
 ) -> int:
-    """在所有可用驱动器上异步并行搜索匹配文件总数"""
-    drives = await asyncio.to_thread(get_available_drives)
-    tasks = []
-    for drive in drives:
-        tasks.append(
-            asyncio.to_thread(
-                client.search,
-                pattern=pattern,
-                filter_dir=drive,
-                filter_ext=filter_ext,
-                last_modify_begin=last_modify_begin,
-                last_modify_end=last_modify_end,
-            )
-        )
+    """全局搜索匹配文件总数。
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    total = 0
-    for res in results:
-        if isinstance(res, (int, float)):
-            total += int(res)
-    return total
+    Anytxt 索引已全局建立，直接用空 filterDir 全局搜索。
+    """
+    return await asyncio.to_thread(
+        client.search,
+        pattern=pattern,
+        filter_dir="",
+        filter_ext=filter_ext,
+        last_modify_begin=last_modify_begin,
+        last_modify_end=last_modify_end,
+    )
 
 
 async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
@@ -834,9 +790,8 @@ async def _handle_status(client: AnytxtClient, args: dict) -> List[TextContent]:
         lines.append("")
 
         try:
-            total1 = await asyncio.to_thread(client.search, pattern="the", filter_dir="C:\\", filter_ext="*")
-            total2 = await asyncio.to_thread(client.search, pattern="the", filter_dir="D:\\", filter_ext="*")
-            lines.append(f"**索引规模估算**: C盘 {total1:,} / D盘 {total2:,} (含 'the' 的文件)")
+            total = await asyncio.to_thread(client.search, pattern="the", filter_dir="", filter_ext="*")
+            lines.append(f"**索引规模估算**: 全局共 {total:,} 个文件被索引（含 'the' 的文件）")
         except Exception:
             lines.append("**索引规模**: 无法获取（索引可能为空或查询超时）")
 

@@ -186,9 +186,12 @@ class AnytxtClient:
     ) -> int:
         """搜索文件，返回匹配数量
         
+        注意：Anytxt 不支持盘符级别的 filterDir 过滤（如 'C:\\'），
+        请使用空字符串搜全局，再在结果层按路径前缀过滤。
+        
         Args:
             pattern: 搜索关键词
-            filter_dir: 限定搜索目录
+            filter_dir: 限定搜索目录（建议用空字符串，具体子目录可传入）
             filter_ext: 文件扩展名过滤
             last_modify_begin: 修改时间起始（Unix时间戳）
             last_modify_end: 修改时间结束（Unix时间戳）
@@ -226,9 +229,12 @@ class AnytxtClient:
     ) -> list[dict]:
         """获取搜索结果列表
         
+        注意：Anytxt 不支持盘符级别的 filterDir 过滤（如 'C:\\', 'F:\\'）。
+        当 filter_dir 为盘符根路径时，会自动退化为全局搜索并在结果层按路径前缀过滤。
+        
         Args:
             pattern: 搜索关键词
-            filter_dir: 限定搜索目录
+            filter_dir: 限定搜索目录（子目录路径可正常使用；传入盘符时自动退化为全局搜索+路径过滤）
             filter_ext: 文件扩展名过滤
             last_modify_begin: 修改时间起始
             last_modify_end: 修改时间结束
@@ -239,11 +245,19 @@ class AnytxtClient:
         Returns:
             文件信息列表，每项包含 fid, name, path, size, modified
         """
+        import re as _re
+        # 判断 filter_dir 是否为盘符根路径（如 'C:\\', 'F:\\', 'c:/'）
+        _is_drive_root = bool(_re.match(r'^[A-Za-z]:[/\\]?$', filter_dir.rstrip('/\\')) if filter_dir else False)
+        # 传给 API 的实际 filterDir：盘符根路径退化为空字符串
+        api_filter_dir = "" if _is_drive_root else filter_dir
+        # 后处理路径过滤用的前缀（盘符时保留驱动器字母前缀）
+        path_prefix = filter_dir.rstrip('/\\').upper() if _is_drive_root else ""
+
         result = self._call(
             "ATRpcServer.Searcher.V1.GetResult",
             {
                 "pattern": pattern,
-                "filterDir": filter_dir,
+                "filterDir": api_filter_dir,
                 "filterExt": filter_ext,
                 "lastModifyBegin": last_modify_begin,
                 "lastModifyEnd": last_modify_end,
@@ -260,8 +274,13 @@ class AnytxtClient:
         files = []
         for file_arr in raw_files:
             if isinstance(file_arr, list) and len(file_arr) >= 4:
-                fid = file_arr[0]
+                fid = str(file_arr[0])  # 确保 fid 为字符串
                 path = file_arr[3]
+                
+                # 盘符退化时：在结果层按路径前缀过滤
+                if path_prefix and not path.upper().startswith(path_prefix):
+                    continue
+                
                 # 缓存 fid -> path 映射
                 self._fid_to_path[fid] = path
                 
@@ -288,21 +307,20 @@ class AnytxtClient:
         last_modify_begin: int = 0,
         last_modify_end: int = 2147483647,
     ) -> int:
-        """在所有可用驱动器上搜索，返回总匹配数量"""
-        drives = get_available_drives()
-        total = 0
-        for drive in drives:
-            try:
-                total += self.search(
-                    pattern=pattern,
-                    filter_dir=drive,
-                    filter_ext=filter_ext,
-                    last_modify_begin=last_modify_begin,
-                    last_modify_end=last_modify_end,
-                )
-            except Exception:
-                continue
-        return total
+        """搜索全局，返回总匹配数量。
+        
+        注意：Anytxt 不支持按盘符过滤，直接用空 filterDir 全局搜索。
+        """
+        try:
+            return self.search(
+                pattern=pattern,
+                filter_dir="",
+                filter_ext=filter_ext,
+                last_modify_begin=last_modify_begin,
+                last_modify_end=last_modify_end,
+            )
+        except Exception:
+            return 0
 
     def get_result_all_drives(
         self,
@@ -314,47 +332,20 @@ class AnytxtClient:
         offset: int = 0,
         order: int = 0,
     ) -> list[dict]:
-        """在所有可用驱动器上搜索，合并结果
+        """全局搜索并返回结果（统一用空 filterDir）。
 
-        当用户未指定搜索目录时使用此方法，自动遍历所有驱动器。
+        Anytxt 不支持按盘符拆分搜索，直接全局搜后分页返回。
         """
-        drives = get_available_drives()
-        all_files: list[dict] = []
-        seen_fids: set[str] = set()
-        per_drive_limit = max(limit + offset, 100)  # 每个驱动器拉取足够数量以支持分页
-
-        for drive in drives:
-            try:
-                files = self.get_result(
-                    pattern=pattern,
-                    filter_dir=drive,
-                    filter_ext=filter_ext,
-                    last_modify_begin=last_modify_begin,
-                    last_modify_end=last_modify_end,
-                    limit=per_drive_limit,
-                    offset=0,  # 每个驱动器从0开始，最后统一分页
-                    order=order,
-                )
-                for f in files:
-                    fid = f.get("fid", "")
-                    if fid and fid not in seen_fids:
-                        seen_fids.add(fid)
-                        all_files.append(f)
-            except Exception:
-                continue
-
-        # 按排序规则整理（order=0 保持 Anytxt 默认排序不做二次排序）
-        if order == 2:
-            all_files.sort(key=lambda f: f.get("modified", 0), reverse=True)
-        elif order == 1:
-            all_files.sort(key=lambda f: f.get("modified", 0))
-        elif order == 4:
-            all_files.sort(key=lambda f: f.get("path", ""), reverse=True)
-        elif order == 3:
-            all_files.sort(key=lambda f: f.get("path", ""))
-
-        # 分页
-        return all_files[offset:offset + limit]
+        return self.get_result(
+            pattern=pattern,
+            filter_dir="",
+            filter_ext=filter_ext,
+            last_modify_begin=last_modify_begin,
+            last_modify_end=last_modify_end,
+            limit=limit,
+            offset=offset,
+            order=order,
+        )
 
     def get_fragment(self, fid: str, pattern: str) -> str:
         """获取单个文本片段
@@ -364,7 +355,7 @@ class AnytxtClient:
             pattern: 搜索关键词
         
         Returns:
-            文本片段
+            文本片段（Anytxt 实际返回字段为 output.text）
         """
         result = self._call(
             "ATRpcServer.Searcher.V1.GetFragment",
@@ -373,7 +364,9 @@ class AnytxtClient:
                 "pattern": pattern,
             }
         )
-        return result.get("data", {}).get("output", {}).get("fragment", "")
+        output = result.get("data", {}).get("output", {})
+        # Anytxt GetFragment 实际返回 output.text（非 output.fragment）
+        return output.get("text", "") or output.get("fragment", "")
     
     def get_fragment_all(self, fid: str, pattern: str) -> list[str]:
         """获取所有文本片段
