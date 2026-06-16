@@ -233,7 +233,7 @@ class EverythingSDK:
         num_results = min(self.dll.Everything_GetNumResults(), max_results)
         results = []
 
-        filename_buffer = ctypes.create_unicode_buffer(260)
+        filename_buffer = ctypes.create_unicode_buffer(4096)
         date_created = ctypes.c_ulonglong()
         date_modified = ctypes.c_ulonglong()
         date_accessed = ctypes.c_ulonglong()
@@ -241,7 +241,7 @@ class EverythingSDK:
 
         for i in range(num_results):
             try:
-                self.dll.Everything_GetResultFullPathNameW(i, filename_buffer, 260)
+                self.dll.Everything_GetResultFullPathNameW(i, filename_buffer, 4096)
                 
                 # Get timestamps
                 self.dll.Everything_GetResultDateCreated(i, date_created)

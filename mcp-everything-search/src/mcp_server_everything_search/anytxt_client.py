@@ -16,13 +16,21 @@ DEFAULT_MAX_IMAGE_KB = 5120  # 单张图片最大 5MB
 DEFAULT_MAX_IMAGES_IN_SEARCH = 3  # 搜索结果中最多标注几张图片
 
 
+_cached_drives: Optional[list[str]] = None
+
+
 def get_available_drives() -> list[str]:
-    """获取系统中所有可用驱动器根路径"""
+    """获取系统中所有可用驱动器根路径（使用缓存避免重复检测阻塞）"""
+    global _cached_drives
+    if _cached_drives is not None:
+        return _cached_drives
+        
     drives = []
     for letter in string.ascii_uppercase:
         root = f"{letter}:\\"
         if os.path.exists(root):
             drives.append(root)
+    _cached_drives = drives
     return drives
 
 
@@ -39,6 +47,11 @@ class AnytxtClient:
         )
         self.timeout = timeout_ms / 1000
         self._request_id = 0
+        self._fid_to_path: dict[str, str] = {}
+        
+    def get_path_by_fid(self, fid: str) -> Optional[str]:
+        """通过文件ID反查物理路径（从之前搜索结果的缓存中获取）"""
+        return self._fid_to_path.get(fid)
     
     def _next_id(self) -> int:
         """生成递增的请求ID"""
@@ -163,18 +176,22 @@ class AnytxtClient:
         # Anytxt返回格式: files是数组的数组 [fid, lastModify, size, path]
         raw_files = result.get("data", {}).get("output", {}).get("files", [])
         
-        # 转换为字典格式
+        # 转换为字典格式并缓存 fid -> path 映射关系
         files = []
         for file_arr in raw_files:
             if isinstance(file_arr, list) and len(file_arr) >= 4:
+                fid = file_arr[0]
                 path = file_arr[3]
+                # 缓存 fid -> path 映射
+                self._fid_to_path[fid] = path
+                
                 # 从路径中提取文件名
                 name = path.split("\\")[-1] if "\\" in path else path.split("/")[-1]
                 # 提取扩展名
                 ext = "." + name.split(".")[-1] if "." in name else ""
                 
                 files.append({
-                    "fid": file_arr[0],
+                    "fid": fid,
                     "modified": file_arr[1],
                     "size": int(file_arr[2]) if file_arr[2] else 0,
                     "path": path,

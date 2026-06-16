@@ -196,8 +196,16 @@ class WindowsSearchProvider(SearchProvider):
     def __init__(self):
         """Initialize Everything SDK."""
         import os
+        from pathlib import Path
         from .everything_sdk import EverythingSDK
-        dll_path = os.getenv('EVERYTHING_SDK_PATH', 'D:\\dev\\tools\\Everything-SDK\\dll\\Everything64.dll')
+        
+        dll_path = os.getenv('EVERYTHING_SDK_PATH')
+        if not dll_path:
+            local_dll = Path(__file__).parent / "Everything64.dll"
+            if local_dll.exists():
+                dll_path = str(local_dll)
+            else:
+                dll_path = 'Everything64.dll'
         self.everything_sdk = EverythingSDK(dll_path)
 
     def search_files(

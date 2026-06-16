@@ -1,5 +1,6 @@
-"""Anytxt MCP Server - 基于Anytxt的文档内容检索"""
+"""Anytxt MCP Server - 基于Anytxt of 文档内容检索"""
 
+import asyncio
 import json
 import os
 import platform
@@ -16,6 +17,7 @@ from .anytxt_client import (
     read_image_base64,
     get_max_images_in_search,
     get_max_image_kb,
+    get_available_drives,
 )
 
 # 环境变量默认值（代码级读取，不依赖 README 文档）
@@ -29,18 +31,12 @@ ENV_ENABLE_SYNC = os.environ.get("ANYTXT_ENABLE_SYNC", "false").lower() in ("tru
 ENV_ENABLE_OCR = os.environ.get("ANYTXT_ENABLE_OCR", "false").lower() in ("true", "1")
 
 
-async def serve() -> None:
-    """运行Anytxt MCP服务器"""
-    server = Server("anytxt-search")
-    client = get_client()
-
-    @server.list_tools()
-    async def list_tools() -> List[Tool]:
-        """返回Anytxt工具列表，sync_index/ocr 按环境变量开关"""
-        tools = [
-            Tool(
-                name="anytxt_search",
-                description="""搜索本地文档内容，返回文件路径和匹配片段。
+def get_tools() -> List[Tool]:
+    """返回Anytxt工具列表，供StdIO及SSE模式共享定义"""
+    tools = [
+        Tool(
+            name="anytxt_search",
+            description="""搜索本地文档内容，返回文件路径和匹配片段。
 
 搜索范围：不指定目录时，自动搜索所有可用驱动器（C:、D:等）。
 如需限定范围，请明确指定 directory 参数。
@@ -53,157 +49,8 @@ async def serve() -> None:
 
 示例：
 - "认证函数" - 搜索包含"认证函数"的文档
-- "error AND log" - 搜索同时包含error和log的文档
+- "error AND log" - 搜索同时包含error and log的文档
 - "*.md" - 搜索所有Markdown文件""",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "搜索关键词，支持布尔语法和通配符"
-                        },
-                        "directory": {
-                            "type": "string",
-                            "description": "限定搜索目录（留空则自动搜索所有驱动器 C:、D: 等）",
-                            "default": ""
-                        },
-                        "extension": {
-                            "type": "string",
-                            "description": "文件扩展名过滤（如 txt, pdf, *）",
-                            "default": "*"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": f"返回结果数量限制（默认20，最大{ENV_MAX_RESULTS}）",
-                            "default": 20,
-                            "minimum": 1,
-                            "maximum": ENV_MAX_RESULTS
-                        },
-                        "offset": {
-                            "type": "integer",
-                            "description": "分页偏移量",
-                            "default": 0,
-                            "minimum": 0
-                        },
-                        "order": {
-                            "type": "integer",
-                            "description": "排序方式: 0=默认, 1=修改时间升序, 2=修改时间降序, 3=路径升序, 4=路径降序",
-                            "default": 0,
-                            "minimum": 0,
-                            "maximum": 4
-                        },
-                        "modified_after": {
-                            "type": "integer",
-                            "description": "修改时间起始（Unix时间戳），0 表示不限",
-                            "default": 0,
-                            "minimum": 0
-                        },
-                        "modified_before": {
-                            "type": "integer",
-                            "description": "修改时间结束（Unix时间戳），2147483647 表示不限",
-                            "default": 2147483647,
-                            "minimum": 0
-                        },
-                        "include_fragment": {
-                            "type": "boolean",
-                            "description": "是否返回内容片段",
-                            "default": True
-                        }
-                    },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="anytxt_get_context",
-                description="""获取文件中与关键词相关的上下文片段。
-
-用于深入查看某个文件中与搜索词相关的所有内容。""",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "fid": {
-                            "type": "string",
-                            "description": "文件ID，来自anytxt_search结果"
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "搜索关键词"
-                        },
-                        "max_fragments": {
-                            "type": "integer",
-                            "description": "最大返回片段数（默认5）",
-                            "default": 5,
-                            "minimum": 1,
-                            "maximum": 20
-                        }
-                    },
-                    "required": ["fid", "query"]
-                }
-            ),
-            Tool(
-                name="anytxt_read_file",
-                description="""读取文件完整内容。
-
-用于深度分析某个文件的完整内容。注意：大文件会被截断。""",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "fid": {
-                            "type": "string",
-                            "description": "文件ID，来自anytxt_search结果"
-                        },
-                        "max_chars": {
-                            "type": "integer",
-                            "description": "最大返回字符数（默认10000）",
-                            "default": 10000,
-                            "minimum": 1000,
-                            "maximum": 50000
-                        }
-                    },
-                    "required": ["fid"]
-                }
-            ),
-        ]
-        if ENV_ENABLE_SYNC:
-            tools.append(Tool(
-                name="anytxt_sync_index",
-                description="""同步指定文件夹到Anytxt索引。
-
-用于确保搜索结果包含最新的文件内容。""",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "folder": {
-                            "type": "string",
-                            "description": "要同步的文件夹路径"
-                        }
-                    },
-                    "required": ["folder"]
-                }
-            ))
-        if ENV_ENABLE_OCR:
-            tools.append(Tool(
-                name="anytxt_ocr",
-                description="""识别图片中的文字内容（需要Anytxt OCR版）。
-
-用于提取图片、扫描件中的文字。""",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "图片文件路径"
-                        }
-                    },
-                    "required": ["file_path"]
-                }
-            ))
-        tools.append(Tool(
-            name="anytxt_count",
-            description="""统计匹配文档数量（不返回文件列表）。
-
-用于快速了解有多少文件包含指定内容。支持与 anytxt_search 相同的搜索语法，速度更快。
-适用场景：确认知识库中是否有相关内容，无需查看具体文件时。""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -213,13 +60,33 @@ async def serve() -> None:
                     },
                     "directory": {
                         "type": "string",
-                        "description": "限定搜索目录（留空则搜索所有驱动器 C:、D: 等）",
+                        "description": "限定搜索目录（留空则自动搜索所有驱动器 C:、D: 等）",
                         "default": ""
                     },
                     "extension": {
                         "type": "string",
                         "description": "文件扩展名过滤（如 txt, pdf, *）",
                         "default": "*"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": f"返回结果数量限制（默认20，最大{ENV_MAX_RESULTS}）",
+                        "default": 20,
+                        "minimum": 1,
+                        "maximum": ENV_MAX_RESULTS
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "分页偏移量",
+                        "default": 0,
+                        "minimum": 0
+                    },
+                    "order": {
+                        "type": "integer",
+                        "description": "排序方式: 0=默认, 1=修改时间升序, 2=修改时间降序, 3=路径升序, 4=路径降序",
+                        "default": 0,
+                        "minimum": 0,
+                        "maximum": 4
                     },
                     "modified_after": {
                         "type": "integer",
@@ -232,138 +99,281 @@ async def serve() -> None:
                         "description": "修改时间结束（Unix时间戳），2147483647 表示不限",
                         "default": 2147483647,
                         "minimum": 0
+                    },
+                    "include_fragment": {
+                        "type": "boolean",
+                        "description": "是否返回内容片段",
+                        "default": True
                     }
                 },
                 "required": ["query"]
             }
-        ))
-        tools.append(Tool(
-            name="anytxt_status",
-            description="""检查 Anytxt 服务状态和索引统计信息。
+        ),
+        Tool(
+            name="anytxt_get_context",
+            description="""获取文件中与关键词相关的上下文片段。
 
-返回 Anytxt 连接状态、服务地址、超时设置和索引文件总数。无需参数。""",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ))
-        tools.append(Tool(
-            name="anytxt_view_image",
-            description="""查看图片文件原图，将图片内容直接传递给 AI 视觉分析。
-
-用于 anytxt_search 搜索到图片文件时，OCR 文本可能不完整或有误，通过此工具查看原图让 AI 直接识别。
-每次调用只返回一张图片，避免上下文过载。不支持查看非图片文件。""",
+用于深入查看某个文件中与搜索词相关的所有内容。""",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "fid": {
                         "type": "string",
-                        "description": "图片文件ID（来自 anytxt_search 结果，优先使用）"
+                        "description": "文件ID，来自anytxt_search结果"
                     },
-                    "file_path": {
+                    "query": {
                         "type": "string",
-                        "description": "图片文件路径（当没有 fid 时使用）"
+                        "description": "搜索关键词"
                     },
-                    "max_size_kb": {
+                    "max_fragments": {
                         "type": "integer",
-                        "description": "图片大小上限(KB)，默认5120（5MB），超过此大小会拒绝",
-                        "default": 5120,
-                        "minimum": 100,
-                        "maximum": 10240
+                        "description": "最大返回片段数（默认5）",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20
                     }
                 },
-                "required": []
+                "required": ["fid", "query"]
+            }
+        ),
+        Tool(
+            name="anytxt_read_file",
+            description="""读取文件完整内容。
+
+用于深度分析某个文件的完整内容。注意：大文件会被截断。""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "fid": {
+                        "type": "string",
+                        "description": "文件ID，来自anytxt_search结果"
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "最大返回字符数（默认10000）",
+                        "default": 10000,
+                        "minimum": 1000,
+                        "maximum": 50000
+                    }
+                },
+                "required": ["fid"]
+            }
+        ),
+    ]
+    if ENV_ENABLE_SYNC:
+        tools.append(Tool(
+            name="anytxt_sync_index",
+            description="""同步指定文件夹到Anytxt索引。
+
+用于确保搜索结果包含最新的文件内容。""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "folder": {
+                        "type": "string",
+                        "description": "要同步的文件夹路径"
+                    }
+                },
+                "required": ["folder"]
             }
         ))
+    if ENV_ENABLE_OCR:
         tools.append(Tool(
-            name="anytxt_search_files",
-            description="""按文件名搜索文件（Everything 引擎，仅 Windows）。
+            name="anytxt_ocr",
+            description="""识别图片中的文字内容（需要Anytxt OCR版）。
+
+用于提取图片、扫描件中的文字。""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "图片文件路径"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        ))
+    tools.append(Tool(
+        name="anytxt_count",
+        description="""统计匹配文档数量（不返回文件列表）。
+
+用于快速了解有多少文件包含指定内容。支持与 anytxt_search 相同的搜索语法，速度更快。
+适用场景：确认知识库中是否有相关内容，无需查看具体文件时。""",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词，支持布尔语法和通配符"
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "限定搜索目录（留空则搜索所有驱动器 C:、D: 等）",
+                    "default": ""
+                },
+                "extension": {
+                    "type": "string",
+                    "description": "文件扩展名过滤（如 txt, pdf, *）",
+                    "default": "*"
+                },
+                "modified_after": {
+                    "type": "integer",
+                    "description": "修改时间起始（Unix时间戳），0 表示不限",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "modified_before": {
+                    "type": "integer",
+                    "description": "修改时间结束（Unix时间戳），2147483647 表示不限",
+                    "default": 2147483647,
+                    "minimum": 0
+                }
+            },
+            "required": ["query"]
+        }
+    ))
+    tools.append(Tool(
+        name="anytxt_status",
+        description="""检查 Anytxt 服务状态和索引统计信息。
+
+返回 Anytxt 连接状态、服务地址、超时设置和索引文件总数。无需参数。""",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    ))
+    tools.append(Tool(
+        name="anytxt_view_image",
+        description="""查看图片文件原图，将图片内容直接传递给 AI 视觉分析。
+
+用于 anytxt_search 搜索到图片文件时，OCR 文本可能不完整或有误，通过此工具查看原图让 AI 直接识别。
+每次调用只返回一张图片，避免上下文过载。不支持查看非图片文件。""",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "fid": {
+                    "type": "string",
+                    "description": "图片文件ID（来自 anytxt_search 结果，优先使用）"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "图片文件路径（当没有 fid 时使用）"
+                },
+                "max_size_kb": {
+                    "type": "integer",
+                    "description": "图片大小上限(KB)，默认5120（5MB），超过此大小会拒绝",
+                    "default": 5120,
+                    "minimum": 100,
+                    "maximum": 10240
+                }
+            },
+            "required": []
+        }
+    ))
+    tools.append(Tool(
+        name="anytxt_search_files",
+        description="""按文件名搜索文件（Everything 引擎，仅 Windows）。
 
 这是纯文件名搜索工具，不搜索文件内容。使用 Everything SDK 进行高速文件索引查找。
 支持 Everything 搜索语法：通配符(*,?)、布尔运算(|, !, <>)、函数(size:, ext:, datemodified: 等)。
 
 **重要**：使用此工具前必须向用户说明并获得明确同意，然后将 user_confirmed 设为 true。
 典型场景：Anytxt 不可用时作为文件名搜索替代方案，或用户明确要求按文件名搜索。""",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索查询，支持 Everything 搜索语法"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "最大返回结果数（默认100）",
-                        "default": 100,
-                        "minimum": 1,
-                        "maximum": 1000
-                    },
-                    "match_path": {
-                        "type": "boolean",
-                        "description": "匹配完整路径而非仅文件名",
-                        "default": False
-                    },
-                    "match_case": {
-                        "type": "boolean",
-                        "description": "区分大小写",
-                        "default": False
-                    },
-                    "match_whole_word": {
-                        "type": "boolean",
-                        "description": "全词匹配",
-                        "default": False
-                    },
-                    "match_regex": {
-                        "type": "boolean",
-                        "description": "使用正则表达式",
-                        "default": False
-                    },
-                    "sort_by": {
-                        "type": "integer",
-                        "description": "排序: 1=名称升 2=名称降 3=路径升 4=路径降 5=大小升 6=大小降 13=修改升 14=修改降",
-                        "default": 1,
-                        "minimum": 1,
-                        "maximum": 26
-                    },
-                    "user_confirmed": {
-                        "type": "boolean",
-                        "description": "用户已明确同意使用 Everything 进行文件名搜索。必须先向用户说明并得到确认后设为 true。",
-                        "default": False
-                    }
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索查询，支持 Everything 搜索语法"
                 },
-                "required": ["query", "user_confirmed"]
-            }
-        ))
-        return tools
+                "max_results": {
+                    "type": "integer",
+                    "description": "最大返回结果数（默认100）",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 1000
+                },
+                "match_path": {
+                    "type": "boolean",
+                    "description": "匹配完整路径而非仅文件名",
+                    "default": False
+                },
+                "match_case": {
+                    "type": "boolean",
+                    "description": "区分大小写",
+                    "default": False
+                },
+                "match_whole_word": {
+                    "type": "boolean",
+                    "description": "全词匹配",
+                    "default": False
+                },
+                "match_regex": {
+                    "type": "boolean",
+                    "description": "使用正则表达式",
+                    "default": False
+                },
+                "sort_by": {
+                    "type": "integer",
+                    "description": "排序: 1=名称升 2=名称降 3=路径升 4=路径降 5=大小升 6=大小降 13=修改升 14=修改降",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 26
+                },
+                "user_confirmed": {
+                    "type": "boolean",
+                    "description": "用户已明确同意使用 Everything 进行文件名搜索。必须先向用户说明并得到确认后设为 true。",
+                    "default": False
+                }
+            },
+            "required": ["query", "user_confirmed"]
+        }
+    ))
+    return tools
+
+
+async def dispatch_tool(client: AnytxtClient, name: str, arguments: dict) -> List[Union[TextContent, ImageContent]]:
+    """分发工具调用接口，供 StdIO 及 SSE 模式共享"""
+    if name == "anytxt_search":
+        return await _handle_search(client, arguments)
+    elif name == "anytxt_get_context":
+        return await _handle_get_context(client, arguments)
+    elif name == "anytxt_read_file":
+        return await _handle_read_file(client, arguments)
+    elif name == "anytxt_sync_index":
+        return await _handle_sync_index(client, arguments)
+    elif name == "anytxt_ocr":
+        return await _handle_ocr(client, arguments)
+    elif name == "anytxt_count":
+        return await _handle_count(client, arguments)
+    elif name == "anytxt_status":
+        return await _handle_status(client, arguments)
+    elif name == "anytxt_view_image":
+        return await _handle_view_image(client, arguments)
+    elif name == "anytxt_search_files":
+        return await _handle_search_files(arguments)
+    else:
+        return [TextContent(
+            type="text",
+            text=f"未知工具: {name}"
+        )]
+
+
+async def serve() -> None:
+    """运行Anytxt MCP服务器"""
+    server = Server("anytxt-search")
+    client = get_client()
+
+    @server.list_tools()
+    async def list_tools() -> List[Tool]:
+        return get_tools()
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> List[Union[TextContent, ImageContent]]:
-        """处理工具调用"""
         try:
-            if name == "anytxt_search":
-                return await _handle_search(client, arguments)
-            elif name == "anytxt_get_context":
-                return await _handle_get_context(client, arguments)
-            elif name == "anytxt_read_file":
-                return await _handle_read_file(client, arguments)
-            elif name == "anytxt_sync_index":
-                return await _handle_sync_index(client, arguments)
-            elif name == "anytxt_ocr":
-                return await _handle_ocr(client, arguments)
-            elif name == "anytxt_count":
-                return await _handle_count(client, arguments)
-            elif name == "anytxt_status":
-                return await _handle_status(client, arguments)
-            elif name == "anytxt_view_image":
-                return await _handle_view_image(client, arguments)
-            elif name == "anytxt_search_files":
-                return await _handle_search_files(arguments)
-            else:
-                return [TextContent(
-                    type="text",
-                    text=f"未知工具: {name}"
-                )]
+            return await dispatch_tool(client, name, arguments)
         except Exception as e:
             return [TextContent(
                 type="text",
@@ -373,6 +383,98 @@ async def serve() -> None:
     options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, options, raise_exceptions=True)
+
+
+async def _get_result_all_drives_async(
+    client: AnytxtClient,
+    pattern: str,
+    filter_ext: str = "*",
+    last_modify_begin: int = 0,
+    last_modify_end: int = 2147483647,
+    limit: int = 300,
+    offset: int = 0,
+    order: int = 0,
+) -> list[dict]:
+    """在所有可用驱动器上异步并行搜索并合并结果"""
+    drives = await asyncio.to_thread(get_available_drives)
+    all_files: list[dict] = []
+    seen_fids: set[str] = set()
+    per_drive_limit = max(limit + offset, 100)
+
+    tasks = []
+    for drive in drives:
+        tasks.append(
+            asyncio.to_thread(
+                client.get_result,
+                pattern=pattern,
+                filter_dir=drive,
+                filter_ext=filter_ext,
+                last_modify_begin=last_modify_begin,
+                last_modify_end=last_modify_end,
+                limit=per_drive_limit,
+                offset=0,
+                order=order,
+            )
+        )
+
+    results_list = await asyncio.gather(*tasks, return_exceptions=True)
+    for res in results_list:
+        if isinstance(res, Exception):
+            continue
+        for f in res:
+            fid = f.get("fid", "")
+            if fid and fid not in seen_fids:
+                seen_fids.add(fid)
+                all_files.append(f)
+
+    # 安全的 modified 提取函数，防止 TypeError
+    def safe_get_modified(f):
+        val = f.get("modified", 0)
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+
+    if order == 2:
+        all_files.sort(key=safe_get_modified, reverse=True)
+    elif order == 1:
+        all_files.sort(key=safe_get_modified)
+    elif order == 4:
+        all_files.sort(key=lambda f: f.get("path", ""), reverse=True)
+    elif order == 3:
+        all_files.sort(key=lambda f: f.get("path", ""))
+
+    return all_files[offset:offset + limit]
+
+
+async def _search_all_drives_async(
+    client: AnytxtClient,
+    pattern: str,
+    filter_ext: str = "*",
+    last_modify_begin: int = 0,
+    last_modify_end: int = 2147483647,
+) -> int:
+    """在所有可用驱动器上异步并行搜索匹配文件总数"""
+    drives = await asyncio.to_thread(get_available_drives)
+    tasks = []
+    for drive in drives:
+        tasks.append(
+            asyncio.to_thread(
+                client.search,
+                pattern=pattern,
+                filter_dir=drive,
+                filter_ext=filter_ext,
+                last_modify_begin=last_modify_begin,
+                last_modify_end=last_modify_end,
+            )
+        )
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    total = 0
+    for res in results:
+        if isinstance(res, (int, float)):
+            total += int(res)
+    return total
 
 
 async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
@@ -398,9 +500,9 @@ async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
     )
 
     if directory:
-        results = client.get_result(filter_dir=directory, **get_kwargs)
+        results = await asyncio.to_thread(client.get_result, filter_dir=directory, **get_kwargs)
     else:
-        results = client.get_result_all_drives(**get_kwargs)
+        results = await _get_result_all_drives_async(client, **get_kwargs)
 
     if not results:
         scope = directory or "所有驱动器(C:、D:等)"
@@ -444,11 +546,11 @@ async def _handle_search(client: AnytxtClient, args: dict) -> List[TextContent]:
         # 获取内容片段
         if include_fragment and fid:
             try:
-                fragment = client.get_fragment(fid, query)
+                fragment = await asyncio.to_thread(client.get_fragment, fid, query)
                 # 回退：片段为空时读取原文提取关键词上下文
                 if not fragment:
                     try:
-                        raw_text = client.get_raw_text_by_fid(fid)
+                        raw_text = await asyncio.to_thread(client.get_raw_text_by_fid, fid)
                         if raw_text and query:
                             idx = raw_text.lower().find(query.lower())
                             if idx >= 0:
@@ -482,7 +584,7 @@ async def _handle_get_context(client: AnytxtClient, args: dict) -> List[TextCont
     max_fragments = min(args.get("max_fragments", 5), ENV_MAX_FRAGMENTS)
 
     # 获取所有片段
-    fragments = client.get_fragment_all(fid, query)
+    fragments = await asyncio.to_thread(client.get_fragment_all, fid, query)
 
     if not fragments:
         return [TextContent(
@@ -511,7 +613,7 @@ async def _handle_read_file(client: AnytxtClient, args: dict) -> List[TextConten
     max_chars = min(args.get("max_chars", 10000), ENV_MAX_RAW_CHARS)
 
     # 获取完整文本
-    raw_text = client.get_raw_text_by_fid(fid)
+    raw_text = await asyncio.to_thread(client.get_raw_text_by_fid, fid)
 
     if not raw_text:
         return [TextContent(
@@ -538,7 +640,7 @@ async def _handle_sync_index(client: AnytxtClient, args: dict) -> List[TextConte
     """处理anytxt_sync_index工具调用"""
     folder = args["folder"]
 
-    success = client.sync_index(folder)
+    success = await asyncio.to_thread(client.sync_index, folder)
 
     if success:
         return [TextContent(
@@ -556,7 +658,7 @@ async def _handle_ocr(client: AnytxtClient, args: dict) -> List[TextContent]:
     """处理anytxt_ocr工具调用"""
     file_path = args["file_path"]
 
-    text = client.ocr(file_path)
+    text = await asyncio.to_thread(client.ocr, file_path)
 
     if not text:
         return [TextContent(
@@ -576,19 +678,14 @@ async def _handle_view_image(client: AnytxtClient, args: dict) -> List[Union[Tex
     file_path = args.get("file_path", "")
     max_size_kb = args.get("max_size_kb", get_max_image_kb())
 
-    # 优先通过 fid 获取文件路径
+    # 优先通过 fid 获取文件路径 (利用 AnytxtClient 实例维护的缓存字典)
     if fid and not file_path:
-        try:
-            raw_text = client.get_raw_text_by_fid(fid)
-            # get_raw_text_by_fid 返回文本，但我们需要路径；通过 get_result 用 fid 搜索来找路径
-            # Anytxt API 没有直接的 "get file info by fid" 接口，但我们可以从搜索结果中匹配
-        except Exception:
-            pass
+        file_path = client.get_path_by_fid(fid) or ""
 
     if not file_path:
         return [TextContent(
             type="text",
-            text="错误: 请提供 file_path（图片文件路径）。可从 anytxt_search 结果中获取路径。"
+            text="错误: 未能根据提供的 fid 找到文件路径，或未提供 file_path（图片文件路径）。可从 anytxt_search 结果中获取路径。"
         )]
 
     if not is_image_file(file_path):
@@ -597,7 +694,7 @@ async def _handle_view_image(client: AnytxtClient, args: dict) -> List[Union[Tex
             text=f"错误: 不是图片文件 ({os.path.splitext(file_path)[1]}). 仅支持 jpg/png/bmp/gif/tiff/webp/ico"
         )]
 
-    result = read_image_base64(file_path, max_size_kb)
+    result = await asyncio.to_thread(read_image_base64, file_path, max_size_kb)
 
     if not result["ok"]:
         return [TextContent(
@@ -628,7 +725,8 @@ async def _handle_count(client: AnytxtClient, args: dict) -> List[TextContent]:
     modified_before = args.get("modified_before", 2147483647)
 
     if directory:
-        count = client.search(
+        count = await asyncio.to_thread(
+            client.search,
             pattern=query,
             filter_dir=directory,
             filter_ext=extension,
@@ -636,7 +734,8 @@ async def _handle_count(client: AnytxtClient, args: dict) -> List[TextContent]:
             last_modify_end=modified_before,
         )
     else:
-        count = client.search_all_drives(
+        count = await _search_all_drives_async(
+            client,
             pattern=query,
             filter_ext=extension,
             last_modify_begin=modified_after,
@@ -658,13 +757,13 @@ async def _handle_status(client: AnytxtClient, args: dict) -> List[TextContent]:
     lines.append("")
 
     try:
-        client.search(pattern="anytxt_health_check_test_xyz", filter_ext="*")
+        await asyncio.to_thread(client.search, pattern="anytxt_health_check_test_xyz", filter_ext="*")
         lines.append("**连接状态**: 已连接")
         lines.append("")
 
         try:
-            total1 = client.search(pattern="the", filter_dir="C:\\", filter_ext="*")
-            total2 = client.search(pattern="the", filter_dir="D:\\", filter_ext="*")
+            total1 = await asyncio.to_thread(client.search, pattern="the", filter_dir="C:\\", filter_ext="*")
+            total2 = await asyncio.to_thread(client.search, pattern="the", filter_dir="D:\\", filter_ext="*")
             lines.append(f"**索引规模估算**: C盘 {total1:,} / D盘 {total2:,} (含 'the' 的文件)")
         except Exception:
             lines.append("**索引规模**: 无法获取（索引可能为空或查询超时）")
@@ -714,7 +813,8 @@ async def _handle_search_files(args: dict) -> List[TextContent]:
         )]
 
     try:
-        results = provider.everything_sdk.search_files(
+        results = await asyncio.to_thread(
+            provider.everything_sdk.search_files,
             query=query,
             max_results=max_results,
             match_path=match_path,
