@@ -6,7 +6,7 @@
       "env": {
         "ANYTXT_ENABLED": "true",
         "ANYTXT_RPC_URL": "http://127.0.0.1:9920",
-        "PYTHONPATH": "D:\\Workspace\\0-0\\AnytxtMCP\\mcp-everything-search\\src"
+        "PYTHONPATH": "F:\\Workspace\\0-0\\AnytxtMCP\\mcp-everything-search\\src"
       }
     }
   }
